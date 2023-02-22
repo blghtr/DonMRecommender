@@ -1,17 +1,48 @@
 import pymongo, pickle, logging, json, gridfs, re
-from lightfm import LightFM
 from numpy import array_split, array
+import os
 
 
-def connect_to_db(config_path):
-    '''Принимает объект logging.Logger и путь до файла с конфигурациями, возвращает объект pymongo.MongoClient'''
+class Storage:
+    def __init__(self, host, port, collection_name_s, db_name='RawData'):
+        client = pymongo.MongoClient(host, port)
+        self.fs = {collection_name: gridfs.GridFS(client[db_name], collection_name)
+                   for collection_name in collection_name_s}
 
-    host, port = get_config(config_path, 'host', 'port')
-    client = pymongo.MongoClient(host, port)
-    db = client['RecDB']
-    return db
+    def clear_storage(self, collection_name=None):
+        if collection_name is None:
+            for fs in self.fs.values():
+                for i in self.fs.list():
+                    self.fs.delete(i._id)
+        else:
+            for i in self.fs[collection_name].list():
+                self.fs.delete(i._id)
 
+    def download_file(self, filename, collection_name):
+        file = self.fs.find_one({'filename': filename})
+        if file is None:
+            logging.error(f'В хранилище {collection_name} отсутствует файл {filename}')
+            return None
+        file_id = file._id
+        with self.fs.get(file_id) as file_bin:
+            res = file_bin.read()
+        return pickle.loads(res)
 
+    def delete_file(self, filename, collection_name):
+        file = self.fs.find_one({'filename': filename})
+        if file is None:
+            logging.error(f'В хранилище {collection_name} отсутствует файл {filename}')
+            return None
+        file_id = file._id
+        self.fs.delete(file_id)
+
+    def upload_file(self, file, filename, collection_name):
+        res_file = self.fs.find_one({'filename': filename})
+        if res_file is not None:
+            logging.error(f'В хранилище {collection_name} уже есть файл {filename}')
+            return None
+        file_id = self.fs.put(pickle.dumps(file), filename=filename)
+        return file_id
 def drop_db(db, *tables_list):
     for coll in tables_list:
         collection = db[f'{coll}']
@@ -181,7 +212,7 @@ def init_model(config_path):
     hyperp = get_config(config_path, 'hyperp')[0]
     hyperp = hyperp['est']
 
-    model = LightFM(**hyperp)
+    model = None #LightFM(**hyperp)
     return model
 
 
@@ -233,8 +264,12 @@ def update_config(config_path, update_dict):
 
 
 def get_config(config_path, *values):
-    with open(config_path, "r") as config:
-        settings = json.load(config)
+    try:
+        with open(config_path, "r") as config:
+            settings = json.load(config)
+    except FileNotFoundError:
+        logging.error(f'Не найден файл конфигураций {config_path}')
+        return None
     res = []
     for val in values:
         if val not in settings:
