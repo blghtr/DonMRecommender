@@ -5,10 +5,10 @@ import json
 from collections import namedtuple
 from urllib.error import HTTPError
 
+
 class DataDownloader:
     def __init__(self, config_path):
         downloader_settings = get_config(config_path, 'dataDownloader')[0]
-        storage_settings = get_config(config_path, 'storage')[0]
         if downloader_settings is not None:
             self.headers, self.counter_id, fields_dict = downloader_settings.get('headers', None),\
                                                          downloader_settings.get('counter_id', None),\
@@ -18,12 +18,7 @@ class DataDownloader:
                                 for req_t, fields in fields_dict.items()}
         else:
             raise ValueError('Отсутствуют конфигурации для загрузки данных.')
-        if storage_settings is not None:
-            self.storage = Storage(storage_settings.get('host'),
-                                   storage_settings.get('port'),
-                                   collection_name='RawData')
-        else:
-            raise ValueError('Отсутствуют конфигурации для хранения данных.')
+        self.storage = Storage(config_path, collection_name_s=['hits'])
         if not self._auth_check():
             raise ValueError('Неверный ключ авторизации')
 
@@ -69,22 +64,20 @@ class DataDownloader:
     def _is_request_possible(self, request_type, s_date, f_date):
         self._check_request_type(request_type)
         fields_str = ','.join([field.id for field in self.fields_dict[request_type]])
-        url = f'https://api-metrika.yandex.net/management/v1/counter/{self.counter_id}/logrequests/evaluate?\
-        date1={str(s_date)}&date2={str(f_date)}&fields={fields_str}&source={request_type}'
+        url = f'https://api-metrika.yandex.net/management/v1/counter/{self.counter_id}/logrequests/evaluate?date1={str(s_date)}&date2={str(f_date)}&fields={fields_str}&source={request_type}'
         response = requests.get(url, headers=self.headers)
         if response.status_code == 200:
             req_possibility = json.loads(response.content)['log_request_evaluation']['possible']
             max_possible_period = json.loads(response.content)['log_request_evaluation']['max_possible_day_quantity']
             if (f_date - s_date).days > max_possible_period:
-                logging.error('Выбранный период превышает квоту: удостоверьтесь, что старые запросы очищены.')
+                logging.error(f'Выбранный период превышает квоту: {max_possible_period}. Удостоверьтесь, что старые запросы очищены.')
             return req_possibility
         raise requests.exceptions.HTTPError(response)
 
     def _request_data(self, request_type, s_date, f_date):
         self._check_request_type(request_type)
         fields_str = ','.join([field.id for field in self.fields_dict[request_type]])
-        url = f'https://api-metrika.yandex.net/management/v1/counter/{self.counter_id}/logrequests?\
-        date1={str(s_date)}&date2={str(f_date)}&fields={fields_str}&source={request_type}'
+        url = f'https://api-metrika.yandex.net/management/v1/counter/{self.counter_id}/logrequests?date1={str(s_date)}&date2={str(f_date)}&fields={fields_str}&source={request_type}'
         response = requests.post(url, headers=self.headers)
         if response.status_code == 200:
             req_id = json.loads(response.content)['log_request']['request_id']
@@ -109,19 +102,18 @@ class DataDownloader:
             fields = [field.name for field in self.fields_dict[request_type]]
             name_pattern = f'{request_type}Part{{}}'
             for part in range(n_parts):
-                response = requests.get(f'https://api-metrika.yandex.net/management/v1/counter/{self.counter_id}/logrequest/\
-                {req_id}/part/{part}/download', headers=self.headers)
-                if response.status_code == '<Response [200]>':
+                try:
+                    response = requests.get(f'https://api-metrika.yandex.net/management/v1/counter/{self.counter_id}/logrequest/{req_id}/part/{part}/download', headers=self.headers)
                     data = [x.split('\t') for x in response.content.decode('utf-8').split('\n')[:-1]]
                     df = pd.DataFrame(data[1:], columns=fields)
                     filename = name_pattern.format(part)
                     _ = self.storage.upload_file(df, filename, request_type)
-                else:
-                    logging.error(f'Не удалось скачать {str(part)} часть данных: {str(response)}. Изменения откатываются.')
+                except Exception as e:
+                    logging.error(f'Не удалось скачать {str(part)} часть данных: {str(e)}. Изменения откатываются.')
                     storage_is_empty = self.storage.clear_storage(request_type)
                     if not storage_is_empty:
                         logging.error('Не удалось скачать откатить изменения, хранилище не очищено.')
-                    raise requests.exceptions.HTTPError(response)
+                    raise requests.exceptions.HTTPError(e)
         else:
             return False
         return True
@@ -150,7 +142,7 @@ class DataDownloader:
                 check_request_result = self._check_request(req_id)
                 req_status = check_request_result['status']
                 n_retries -= 1
-            if req_status != 'processed' and n_retries == 0:
+            if req_status != 'processed':
                 logging.error('Данные не были подготовлены в течение двух часов. Работа программы остановлена.')
             else:
                 n_parts = len(check_request_result['parts'])
