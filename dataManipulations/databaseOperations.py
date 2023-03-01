@@ -4,6 +4,7 @@ import datetime
 import pymongo, pickle, logging, json, gridfs, re
 from pymongo.errors import ConnectionFailure, OperationFailure
 from numpy import array_split, array
+from collections import Counter
 import os
 
 
@@ -66,10 +67,12 @@ class Storage:
 class DataBase:
     def __init__(self, config_path, db_name='Records'):
         settings = get_config(config_path, 'storage')[0]
-        host, port, self.batch_size, self.doc_batch_size, self.base_collections = settings['host'], settings['port'],\
-                                                                                  settings['batch_size'],\
-                                                                                  settings['doc_batch_size'],\
-                                                                                  settings['collections']
+        host, port, self.batch_size, self.doc_batch_size, self.base_collections, self.min_freq = settings['host'], \
+                                                                                                 settings['port'],\
+                                                                                                 settings['batch_size'],\
+                                                                                                 settings['doc_batch_size'],\
+                                                                                                 settings['collections'],\
+                                                                                                 settings['min_freq']
         cities = list(get_config(config_path, 'preparator')[0]['cities'].keys())
         self.collections = [''.join([collection, city]) for collection in self.base_collections for city in cities]
         self.client = pymongo.MongoClient(host, port)
@@ -102,10 +105,6 @@ class DataBase:
                 _ = collection.create_indexes([index1, index2])
             else:
                 _ = collection.create_index([("id", pymongo.TEXT)], unique=True)
-                _ = collection.insert_one({
-                    'id': '-1',
-                    'latestUpd': None
-                })
 
     def __getitem__(self, collection_name):
         return self.db[collection_name]
@@ -116,12 +115,34 @@ class DataBase:
                 self.db.drop_collection(coll)
                 logging.info(f'Коллекция {coll} удалена.')
 
+    def update_filter(self, city, pages_counter):
+        pages_counter = {page: count for page, count in pages_counter.items() if count < self.min_freq}
+        self.update_interactions(city, pages_counter, 'filter')
+
+    def get_blacklist(self, city, session=None):
+        if session is None:
+            with self.client.start_session() as session:
+                return self._get_blacklist(city, session)
+        return self._get_blacklist(city, session)
+
+    def _get_blacklist(self, city, session):
+        with session.start_transaction():
+            try:
+                collection = self.db[''.join(['filter', city])]
+                black_list = collection.find({}, {'_id': False, 'id': True})
+                return set([doc['id'] for doc in black_list])
+
+            except (ConnectionFailure, OperationFailure) as e:
+                session.abort_transaction()
+                print("Transaction aborted", e)
+
     def update_mappings(self, city, users, items):
         '''Принимает объект pymongo.MongoClient, название города, список юзеров, список объектов, объект logging.Logger.
         Дополняет мэппинги в БД новыми юзерами и объектами, фиксирует дату обновления.'''
         logging.info('Обновление словарей соответствий.')
         with self.client.start_session() as session:
             try:
+                blacklist = self.get_blacklist(city, session)
                 with session.start_transaction():
                     for (coll, obj_set) in ((f'umap{city}', users), (f'imap{city}', items)):
                         collection = self.db[coll]
@@ -130,7 +151,7 @@ class DataBase:
                                                    {'$set': {'latestUpd': self.date}})
                         updated = [doc['id'] for doc in collection.find({'latestUpd': self.date},
                                                                         {'id': True, '_id': False})]
-                        to_insert = tuple(obj_set - set(updated))
+                        to_insert = tuple(obj_set - set(updated)) if coll == f'umap{city}' else tuple(obj_set - set(updated) - blacklist)
                         if to_insert:
                             for batch in array_split(array(list(to_insert)), len(to_insert) / self.batch_size + 1):
                                 latest_index = collection.find({},
@@ -144,29 +165,33 @@ class DataBase:
                 session.abort_transaction()
                 print("Transaction aborted")
 
-
-    def update_interactions(self, city, inter_dict, collection='views'):
+    def update_interactions(self, city, inter_dict, collection_name='views'):
         '''Принимает объект pymongo.MongoClient, название города, словарь взаимодействий, объект logging.Logger.
         Обновляет взаимодействия в БД.'''
         logging.info('Обновление словарей взаимодействий.')
         with self.client.start_session() as session:
             try:
                 with session.start_transaction():
-                    collection = self.db[''.join([collection, city])]
+                    collection = self.db[''.join([collection_name, city])]
                     to_update = []
                     for batch in array_split(array(list(inter_dict)), len(inter_dict) / self.batch_size + 1):
                         to_update += [doc['id'] for doc in collection.find({'id': {'$in': batch.tolist()}},
-                                                                           {'id': True, '_id': False})]
+                                                                     {'id': True, '_id': False})]
                     if to_update:
                         for batch in array_split(array(to_update), len(to_update) / self.doc_batch_size + 1):
                             ids_to_del, docs_to_add = [], []
                             for doc in collection.find({'id': {'$in': batch.tolist()}},
-                                                       {'id': True, '_id': False, 'interactions': True}):
+                                                 {'id': True, '_id': False, 'interactions': True}):
                                 doc = copy.deepcopy(doc)
                                 ids_to_del.append(doc['id'])
-                                doc['interactions'] = {k: doc['interactions'].get(k, 0) + inter_dict[doc['id']].get(k, 0)
-                                                      for k in set(doc['interactions']) | set(inter_dict[doc['id']])}
-                                docs_to_add.append(doc)
+                                if collection_name != 'filter':
+                                    doc['interactions'] = {k: doc['interactions'].get(k, 0) + inter_dict[doc['id']].get(k, 0)
+                                                          for k in set(doc['interactions']) | set(inter_dict[doc['id']])}
+                                    docs_to_add.append(doc)
+                                else:
+                                    doc['interactions'] = doc['interactions'] + inter_dict[doc['id']]
+                                    if doc['interactions'] < self.min_freq:
+                                        docs_to_add.append(doc)
                             collection.delete_many({'id': {'$in': ids_to_del}})
                             collection.insert_many(docs_to_add)
 
@@ -181,15 +206,53 @@ class DataBase:
                 session.abort_transaction()
                 print("Transaction aborted")
 
+    def merge_temp(self, city, write_goals=False):
+        with self.client.start_session() as session:
+            try:
+                blacklist = self.get_blacklist(city, session)
+                sources = ('Views', 'Goals') if write_goals else ('Views',)
+                with session.start_transaction():
+                    for source in sources:
+                        temp, collection = self.db[''.join(['temp', source, city])], self.db[''.join([source, city])]
+                        to_transfer = {}
+                        to_update = []
+                        for doc in temp.find({}, {'_id': False, 'id': True, 'interactions': True}):
+                            doc2keep = copy.deepcopy(doc)
+                            doc2keep['interactions'] = {}
+                            doc2move = copy.deepcopy(doc)
+                            for pageID, _ in doc['interactions'].items():
+                                if pageID in blacklist:
+                                    doc2keep['interactions'][pageID] = doc2move['interactions'].pop(pageID)
+                            if doc2move['interactions']:
+                                to_transfer[doc2move['id']] = doc2move
+                                if doc2keep['interactions']:
+                                    to_update.append(doc2keep)
+                        temp.delete_many({'id': {'$in': list(to_transfer.keys())}})
+                        temp.insert_many(to_update)
+                        to_update = []
+                        for doc in collection.find({'id': {'$in': list(to_transfer.keys())}}):
+                            interactions = Counter(doc['interactions'])
+                            interactions.update(to_transfer[doc['id']]['interactions'])
+                            doc['interactions'] = interactions
+                            to_update.append(doc)
+                        if to_update:
+                            collection.delete_many({'id': {'$in': list(to_transfer.keys())}})
+                            collection.insert_many(to_update)
+            except (ConnectionFailure, OperationFailure):
+                session.abort_transaction()
+                print("Transaction aborted")
+
     def update_stream(self, city, stream_dict):
         with self.client.start_session() as session:
+            blacklist = self.get_blacklist(city, session)
             try:
                 with session.start_transaction():
                     collection = self.db[''.join(['stream', city])]
                     stream_data = ({'userID': user,
                                     'pageID': url,
                                     'timestamp': timestamp,
-                                    'split': 'train'} for user in stream_dict for url, timestamp in stream_dict[user])
+                                    'split': 'train'} for user in stream_dict for url, timestamp in stream_dict[user]
+                                   if url not in blacklist)
                     batch = []
                     for doc in stream_data:
                         batch.append(doc)

@@ -22,6 +22,17 @@ class DataHandler:
         else:
             raise ValueError('Не удалось получить конфигурацию предпроцессора по заданному пути')
 
+    def _filter_input(self, city, inter_dict):
+        blacklist = self.db.get_blacklist(city)
+        valid_input, invalid_input = defaultdict(dict), defaultdict(dict)
+        for uID, counter in inter_dict.items():
+            for pageID, count in counter.items():
+                if pageID not in blacklist:
+                    valid_input[uID][pageID] = count
+                else:
+                    invalid_input[uID][pageID] = count
+        return valid_input, invalid_input
+
     def write_upd(self, city, write_goals=False):
         '''Принимает название города, словарь визиты-юзеры и объект logging.Logger, возвращает словарь с данными'''
         filenames = array(self.storage['hits'].list())
@@ -45,12 +56,21 @@ class DataHandler:
                                                   for filename in batch)
             not_found_watches_counter += sum([i[1][0] for i in part_res])
             for j, part in enumerate(part_res):
+                pages_counter = Counter()
+                for _, user_counter in part[0]['u2v'].items():
+                    pages_counter.update(user_counter)
+                self.db.update_filter(city, pages_counter)
                 users, items = part[0]['users'], part[0]['pages']
                 self.db.update_mappings(city, users, items)
-                self.db.update_interactions(city, part[0]['u2v'])
+                valid_input, invalid_input = self._filter_input(city, part[0]['u2v'])
+                self.db.update_interactions(city, valid_input)
+                self.db.update_interactions(city, invalid_input, collection_name='tempViews')
                 self.db.update_stream(city, part[0]['stream'])
                 if write_goals:
-                    self.db.update_interactions(city, part[0]['u2g'], 'goals')
+                    valid_input, invalid_input = self._filter_input(city, part[0]['u2g'])
+                    self.db.update_interactions(city, valid_input, 'goals')
+                    self.db.update_interactions(city, invalid_input, collection_name='tempGoals')
+            self.db.merge_temp(city)
         logging.info(f'{not_found_watches_counter} записей удалено в процессе обработки посещений по причине: \
     номера просмотров не найдены.')
 
